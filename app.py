@@ -1,907 +1,974 @@
-import io
-import json
 import os
 import re
-from datetime import datetime
-
-import numpy as np
-import pandas as pd
-import requests
+import io
+import json
 import streamlit as st
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+import pandas as pd
+from openai import OpenAI
+from urllib.request import urlopen, Request
+from urllib.parse import urlparse, parse_qs, quote
+
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
+
+try:
+    from docx import Document
+except ImportError:
+    Document = None
 
 
-# ============================================================
-# AI-NOC Copilot
-# Beginner-friendly Streamlit application
-# Modules:
-#   1. Incident Analysis (RAG + LLM)
-#   2. Network Health (CSV analysis)
-#   3. NOC Report Generator
-# ============================================================
-
-st.set_page_config(
-    page_title="AI-NOC Copilot",
-    page_icon="🛡️",
-    layout="wide",
-)
+# =========================================================
+# Fixed Google Drive knowledge source
+# =========================================================
+# Paste your Google Drive file/folder link ONCE here.
+# After that, the app loads this source automatically; no repeated upload/paste is needed.
+FIXED_GOOGLE_DRIVE_URL = "https://drive.google.com/drive/folders/1nJwrAhBnX9wjuo4TtWNSOtvvq8gl6apT"
 
 
-# -----------------------------
-# Configuration
-# -----------------------------
-DEFAULT_LLM_BASE_URL = "https://api.groq.com/openai/v1/chat/completions"
-DEFAULT_LLM_MODEL = "llama-3.3-70b-versatile"
+# =========================================================
+# 1. Text extraction
+# =========================================================
+def extract_text_from_bytes(data, filename):
+    name = filename.lower()
 
-SUPPORTED_DOC_TYPES = {
-    ".txt",
-    ".md",
-    ".csv",
-    ".pdf",
-    ".docx",
-}
-
-
-# -----------------------------
-# Utility functions
-# -----------------------------
-def get_secret(name, default=None):
-    """Read a value from Streamlit secrets first, then environment variables."""
-    try:
-        if name in st.secrets:
-            return st.secrets[name]
-    except Exception:
-        pass
-    return os.getenv(name, default)
-
-
-def clean_text(text):
-    text = text or ""
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-
-def chunk_text(text, chunk_size=1200, overlap=200):
-    """Simple character-based chunking suitable for beginner RAG projects."""
-    text = clean_text(text)
-    if not text:
-        return []
-
-    chunks = []
-    start = 0
-    step = max(1, chunk_size - overlap)
-
-    while start < len(text):
-        chunk = text[start:start + chunk_size].strip()
-        if chunk:
-            chunks.append(chunk)
-        start += step
-
-    return chunks
-
-
-# -----------------------------
-# LLM
-# -----------------------------
-def call_llm(messages, temperature=0.2):
-    """
-    Calls an OpenAI-compatible chat-completions endpoint.
-
-    Default endpoint is Groq.
-    You can point LLM_BASE_URL to another compatible provider if required.
-    """
-    api_key = get_secret("LLM_API_KEY") or get_secret("GROQ_API_KEY")
-    base_url = get_secret("LLM_BASE_URL", DEFAULT_LLM_BASE_URL)
-    model = get_secret("LLM_MODEL", DEFAULT_LLM_MODEL)
-
-    if not api_key:
-        return None, (
-            "LLM API key is not configured. Add LLM_API_KEY or GROQ_API_KEY "
-            "to Streamlit secrets."
-        )
-
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-    }
-
-    try:
-        response = requests.post(
-            base_url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=60,
-        )
-        response.raise_for_status()
-        data = response.json()
-        answer = data["choices"][0]["message"]["content"]
-        return answer, None
-    except requests.RequestException as exc:
-        return None, f"LLM request failed: {exc}"
-    except (KeyError, TypeError, ValueError) as exc:
-        return None, f"Unexpected LLM response: {exc}"
-
-
-# -----------------------------
-# Document extraction
-# -----------------------------
-def extract_pdf_text(file_bytes):
-    try:
-        from pypdf import PdfReader
-
-        reader = PdfReader(io.BytesIO(file_bytes))
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
-    except Exception as exc:
-        return f"[PDF extraction error: {exc}]"
-
-
-def extract_docx_text(file_bytes):
-    try:
-        from docx import Document
-
-        doc = Document(io.BytesIO(file_bytes))
-        return "\n".join(p.text for p in doc.paragraphs)
-    except Exception as exc:
-        return f"[DOCX extraction error: {exc}]"
-
-
-def extract_uploaded_document(uploaded_file):
-    suffix = Path(uploaded_file.name).suffix.lower()
-    data = uploaded_file.getvalue()
-
-    if suffix in {".txt", ".md"}:
+    if name.endswith(".txt"):
         return data.decode("utf-8", errors="ignore")
 
-    if suffix == ".csv":
-        try:
-            df = pd.read_csv(io.BytesIO(data))
-            return df.to_csv(index=False)
-        except Exception:
-            return data.decode("utf-8", errors="ignore")
+    if name.endswith(".pdf") and PdfReader:
+        reader = PdfReader(io.BytesIO(data))
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
 
-    if suffix == ".pdf":
-        return extract_pdf_text(data)
-
-    if suffix == ".docx":
-        return extract_docx_text(data)
+    if name.endswith(".docx") and Document:
+        document = Document(io.BytesIO(data))
+        return "\n".join(p.text for p in document.paragraphs)
 
     return ""
 
 
-# -----------------------------
-# Google Drive RAG
-# -----------------------------
-def get_drive_service():
-    """
-    Creates a Google Drive API service from Streamlit secrets.
-
-    Supported secret format:
-      [google_service_account]
-      type = "service_account"
-      project_id = "..."
-      private_key_id = "..."
-      private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
-      client_email = "..."
-      client_id = "..."
-      token_uri = "https://oauth2.googleapis.com/token"
-    """
-    try:
-        from google.oauth2 import service_account
-        from googleapiclient.discovery import build
-
-        if "google_service_account" not in st.secrets:
-            return None, "google_service_account is not configured."
-
-        service_account_info = dict(st.secrets["google_service_account"])
-
-        credentials = service_account.Credentials.from_service_account_info(
-            service_account_info,
-            scopes=["https://www.googleapis.com/auth/drive.readonly"],
-        )
-
-        service = build("drive", "v3", credentials=credentials, cache_discovery=False)
-        return service, None
-    except Exception as exc:
-        return None, f"Google Drive connection failed: {exc}"
-
-
-def list_drive_files(service, folder_id=None):
-    query_parts = [
-        "trashed = false",
+def split_into_chunks(text, words_per_chunk=700):
+    words = text.split()
+    return [
+        " ".join(words[i:i + words_per_chunk]).strip()
+        for i in range(0, len(words), words_per_chunk)
+        if " ".join(words[i:i + words_per_chunk]).strip()
     ]
 
-    if folder_id:
-        query_parts.append(f"'{folder_id}' in parents")
 
-    query = " and ".join(query_parts)
-
-    results = []
-    page_token = None
-
-    while True:
-        response = (
-            service.files()
-            .list(
-                q=query,
-                spaces="drive",
-                fields="nextPageToken, files(id,name,mimeType,size)",
-                pageSize=100,
-                pageToken=page_token,
-            )
-            .execute()
-        )
-
-        results.extend(response.get("files", []))
-        page_token = response.get("nextPageToken")
-
-        if not page_token:
-            break
-
-    return results
-
-
-def download_drive_file(service, file_info):
-    file_id = file_info["id"]
-    name = file_info["name"]
-    mime = file_info.get("mimeType", "")
-
-    # Google-native documents need export.
-    if mime == "application/vnd.google-apps.document":
-        request = service.files().export_media(
-            fileId=file_id,
-            mimeType="text/plain",
-        )
-        data = request.execute()
-        return name + ".txt", data.decode("utf-8", errors="ignore")
-
-    if mime == "application/vnd.google-apps.spreadsheet":
-        request = service.files().export_media(
-            fileId=file_id,
-            mimeType="text/csv",
-        )
-        data = request.execute()
-        return name + ".csv", data.decode("utf-8", errors="ignore")
-
-    if mime == "application/pdf":
-        request = service.files().get_media(fileId=file_id)
-        data = request.execute()
-        return name, extract_pdf_text(data)
-
-    if mime in {
-        "text/plain",
-        "text/markdown",
-        "text/csv",
-    }:
-        request = service.files().get_media(fileId=file_id)
-        data = request.execute()
-        return name, data.decode("utf-8", errors="ignore")
-
-    if mime == (
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    ):
-        request = service.files().get_media(fileId=file_id)
-        data = request.execute()
-        return name, extract_docx_text(data)
-
-    return name, ""
-
-
-@st.cache_data(show_spinner=False)
-def load_drive_documents(folder_id):
-    service, error = get_drive_service()
-    if error:
-        return [], error
-
+# =========================================================
+# 2. Google Drive helpers
+# =========================================================
+def get_google_drive_api_key():
     try:
-        files = list_drive_files(service, folder_id)
-        documents = []
-
-        for file_info in files:
-            suffix = Path(file_info["name"]).suffix.lower()
-            mime = file_info.get("mimeType", "")
-
-            supported = (
-                suffix in SUPPORTED_DOC_TYPES
-                or mime
-                in {
-                    "application/vnd.google-apps.document",
-                    "application/vnd.google-apps.spreadsheet",
-                }
-            )
-
-            if not supported:
-                continue
-
-            name, text = download_drive_file(service, file_info)
-            if text and not text.startswith("["):
-                documents.append(
-                    {
-                        "name": name,
-                        "text": clean_text(text),
-                    }
-                )
-
-        return documents, None
-
-    except Exception as exc:
-        return [], f"Google Drive document loading failed: {exc}"
+        return st.secrets["GOOGLE_DRIVE_API_KEY"]
+    except Exception:
+        return os.getenv("GOOGLE_DRIVE_API_KEY")
 
 
-# -----------------------------
-# RAG index
-# -----------------------------
-def build_rag_index(documents):
-    chunks = []
+def extract_drive_id(url):
+    patterns = [
+        r"/file/d/([a-zA-Z0-9_-]+)",
+        r"/folders/([a-zA-Z0-9_-]+)",
+        r"[?&]id=([a-zA-Z0-9_-]+)",
+    ]
 
-    for document in documents:
-        for index, chunk in enumerate(chunk_text(document["text"])):
-            chunks.append(
-                {
-                    "document": document["name"],
-                    "chunk_id": index,
-                    "text": chunk,
-                }
-            )
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
 
-    if not chunks:
-        return None
+    return None
 
-    vectorizer = TfidfVectorizer(
-        stop_words="english",
-        ngram_range=(1, 2),
-        max_features=12000,
+
+def google_drive_api(url):
+    api_key = get_google_drive_api_key()
+    if not api_key:
+        raise ValueError("GOOGLE_DRIVE_API_KEY is not configured.")
+
+    file_id = extract_drive_id(url)
+    if not file_id:
+        raise ValueError("Could not find a Google Drive file/folder ID in the link.")
+
+    return file_id, api_key
+
+
+def drive_get_metadata(file_id, api_key):
+    endpoint = (
+        "https://www.googleapis.com/drive/v3/files/"
+        + file_id
+        + "?fields=id,name,mimeType,size&key="
+        + api_key
+    )
+    request = Request(endpoint, headers={"Accept": "application/json"})
+
+    with urlopen(request, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def drive_download_file(file_id, api_key):
+    metadata = drive_get_metadata(file_id, api_key)
+    name = metadata.get("name", "drive_file")
+
+    mime = metadata.get("mimeType", "")
+
+    if mime == "application/vnd.google-apps.document":
+        export_url = (
+            "https://www.googleapis.com/drive/v3/files/"
+            + file_id
+            + "/export?mimeType=text/plain&key="
+            + api_key
+        )
+        request = Request(export_url, headers={"Accept": "text/plain"})
+        with urlopen(request, timeout=30) as response:
+            return name + ".txt", response.read()
+
+    if mime.startswith("application/vnd.google-apps."):
+        raise ValueError(
+            f"Google Workspace file '{name}' is not supported yet. "
+            "Use a TXT, PDF, or DOCX file in the Drive folder."
+        )
+
+    download_url = (
+        "https://www.googleapis.com/drive/v3/files/"
+        + file_id
+        + "?alt=media&key="
+        + api_key
+    )
+    request = Request(download_url)
+
+    with urlopen(request, timeout=60) as response:
+        return name, response.read()
+
+
+def drive_list_folder(folder_id, api_key):
+    query = (
+        "'"
+        + folder_id
+        + "' in parents and trashed = false"
+        + " and (mimeType = 'text/plain'"
+        + " or mimeType = 'application/pdf'"
+        + " or mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')"
     )
 
-    matrix = vectorizer.fit_transform([item["text"] for item in chunks])
+    endpoint = (
+        "https://www.googleapis.com/drive/v3/files"
+        "?q=" + quote(query)
+        + "&fields=files(id,name,mimeType,size)"
+        + "&pageSize=100"
+        + "&key=" + api_key
+    )
 
-    return {
-        "chunks": chunks,
-        "vectorizer": vectorizer,
-        "matrix": matrix,
-    }
+    request = Request(endpoint, headers={"Accept": "application/json"})
+
+    with urlopen(request, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8")).get("files", [])
 
 
-def retrieve_context(index, query, top_k=5):
-    if not index or not query.strip():
-        return []
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_google_drive(url):
+    file_id, api_key = google_drive_api(url)
+    metadata = drive_get_metadata(file_id, api_key)
 
-    query_vector = index["vectorizer"].transform([query])
-    scores = cosine_similarity(query_vector, index["matrix"]).flatten()
+    chunks = []
+    loaded_names = []
 
-    top_indexes = np.argsort(scores)[::-1][:top_k]
+    if metadata.get("mimeType") == "application/vnd.google-apps.folder":
+        files = drive_list_folder(file_id, api_key)
 
-    results = []
-    for i in top_indexes:
-        if scores[i] <= 0:
+        if not files:
+            raise ValueError(
+                "No supported TXT, PDF, or DOCX files were found in the folder."
+            )
+
+        for item in files:
+            name, data = drive_download_file(item["id"], api_key)
+            text = extract_text_from_bytes(data, name)
+
+            if text.strip():
+                chunks.extend(split_into_chunks(text))
+                loaded_names.append(name)
+    else:
+        name, data = drive_download_file(file_id, api_key)
+        text = extract_text_from_bytes(data, name)
+
+        if not text.strip():
+            raise ValueError(
+                "The Drive file could not be converted into readable text."
+            )
+
+        chunks.extend(split_into_chunks(text))
+        loaded_names.append(name)
+
+    return chunks, loaded_names
+
+
+# =========================================================
+# 3. Focused RAG retrieval
+# =========================================================
+# This is intentionally lightweight: no vector database or embeddings.
+# The retriever removes common words, gives extra weight to exact/domain
+# terms, and filters weak matches so unrelated incidents are not shown.
+STOP_WORDS = {
+    "a", "an", "the", "is", "are", "was", "were", "what", "why", "how",
+    "can", "could", "would", "should", "do", "does", "did", "to", "of",
+    "in", "on", "for", "from", "with", "and", "or", "my", "your", "this",
+    "that", "it", "be", "go", "goes", "going", "cause", "causes", "reason",
+    "problem", "issue", "incident", "network", "session", "down",
+}
+
+# Important NOC/domain terms get stronger matching.
+DOMAIN_TERMS = {
+    "bgp", "ospf", "mtu", "crc", "packet", "loss", "congestion",
+    "interface", "neighbor", "adjacency", "peer", "prefix", "route",
+    "routing", "authentication", "area", "optic", "fiber", "duplex",
+}
+
+def get_words(text):
+    return set(re.findall(r"[a-zA-Z0-9_-]+", text.lower()))
+
+
+def retrieve_knowledge(question, uploaded_chunks, top_k=4):
+    query_words = get_words(question)
+    meaningful_query = query_words - STOP_WORDS
+
+    # If the question contains a strong protocol/topic term, prefer only
+    # chunks that contain that same topic. This prevents a BGP question from
+    # returning OSPF/MTU/CRC incidents merely because they also say "down".
+    topic_terms = meaningful_query.intersection(DOMAIN_TERMS)
+
+    candidates = []
+    for number, chunk in enumerate(uploaded_chunks, start=1):
+        chunk_words = get_words(chunk)
+
+        if topic_terms and not topic_terms.intersection(chunk_words):
             continue
 
-        item = dict(index["chunks"][i])
-        item["score"] = float(scores[i])
-        results.append(item)
+        overlap = meaningful_query.intersection(chunk_words)
+        score = len(overlap)
 
-    return results
+        # Stronger score for domain terms and exact multi-word phrases.
+        score += 2 * len(overlap.intersection(DOMAIN_TERMS))
+
+        q_lower = question.lower().strip()
+        c_lower = chunk.lower()
+        if q_lower and q_lower in c_lower:
+            score += 10
+
+        # Reward common incident phrases such as "bgp session", "ospf
+        # neighbor", "crc errors", and "mtu mismatch".
+        phrase_hits = 0
+        for phrase in (
+            "bgp session", "bgp peer", "ospf neighbor", "ospf adjacency",
+            "crc errors", "crc error", "packet loss", "interface errors",
+            "mtu mismatch", "mtu problem", "link congestion",
+        ):
+            if phrase in q_lower and phrase in c_lower:
+                phrase_hits += 4
+        score += phrase_hits
+
+        if score > 0:
+            candidates.append((score, len(overlap), f"RAG chunk {number}", chunk))
+
+    if not candidates:
+        return []
+
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    best_score = candidates[0][0]
+
+    # Keep only strong matches. If one document is clearly the best match,
+    # return only that document rather than filling the UI with weak chunks.
+    strong = [item for item in candidates if item[0] >= max(3, best_score * 0.60)]
+
+    # For a focused incident query, one highly relevant chunk is preferred.
+    if topic_terms and strong:
+        strong = strong[:1]
+
+    return [
+        {"source": source, "text": text}
+        for _, _, source, text in strong[:top_k]
+    ]
 
 
-def format_context(results):
-    if not results:
-        return "No relevant knowledge-base evidence was retrieved."
-
-    blocks = []
-    for item in results:
-        blocks.append(
-            f"Source: {item['document']} | Relevance: {item['score']:.2f}\n"
-            f"{item['text']}"
-        )
-
-    return "\n\n---\n\n".join(blocks)
+# =========================================================
+# 4. Groq
+# =========================================================
+def get_groq_key():
+    try:
+        return st.secrets["GROQ_API_KEY"]
+    except Exception:
+        return os.getenv("GROQ_API_KEY")
 
 
-# -----------------------------
-# Incident Analysis
-# -----------------------------
-def incident_analysis(subject, description, rag_results):
-    context = format_context(rag_results)
+def call_llm(question, rag_context=None):
+    api_key = get_groq_key()
 
-    system_prompt = """
-You are AI-NOC Copilot assisting a NOC engineer.
+    if not api_key:
+        return None, "GROQ_API_KEY is not configured."
+
+    if rag_context:
+        prompt = f"""
+You are an AI NOC Copilot.
+
+Answer the user's question using the retrieved content from the user's
+RAG documents.
+
+USER QUESTION:
+{question}
+
+RETRIEVED RAG CONTENT:
+{rag_context}
 
 Rules:
-1. Be beginner-friendly and concise.
-2. Use only the supplied incident information and retrieved evidence.
-3. Never invent device names, IP addresses, VLANs, causes, alarms, commands,
-   timestamps, or network facts.
-4. Clearly separate evidence from inference.
-5. If evidence is insufficient, say that it is insufficient.
-6. The NOC engineer remains responsible for verification and the final decision.
-7. Do not recommend a risky production change as if it were already approved.
+- Use the RAG content as the primary source.
+- Clearly explain the answer.
+- Do not invent information not supported by the context.
+- If the context is insufficient, say so.
 """
-
-    user_prompt = f"""
-Incident subject:
-{subject}
-
-Incident description:
-{description}
-
-Retrieved knowledge-base evidence:
-{context}
-
-Analyze the incident and return these sections:
-
-1. Incident classification
-2. Evidence from knowledge base
-3. AI assessment
-4. Possible root cause(s) - label as hypothesis unless directly supported
-5. Recommended checks
-6. Confidence: High / Medium / Low
-7. Engineer verification / final decision
-
-When comparing the knowledge-base information with your assessment, explicitly
-state where they agree, differ, or where evidence is missing.
-"""
-
-    return call_llm(
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.1,
-    )
-
-
-# -----------------------------
-# Network Health
-# -----------------------------
-def detect_metric_columns(df):
-    numeric = df.select_dtypes(include=np.number).columns.tolist()
-
-    groups = {
-        "utilization": [],
-        "latency": [],
-        "packet_loss": [],
-        "errors": [],
-        "availability": [],
-    }
-
-    for col in numeric:
-        name = col.lower().replace(" ", "_")
-
-        if any(x in name for x in ["util", "cpu", "memory", "bandwidth", "usage"]):
-            groups["utilization"].append(col)
-
-        if any(x in name for x in ["latency", "delay", "rtt"]):
-            groups["latency"].append(col)
-
-        if any(x in name for x in ["loss", "packet_loss"]):
-            groups["packet_loss"].append(col)
-
-        if any(x in name for x in ["error", "crc", "discard", "drop"]):
-            groups["errors"].append(col)
-
-        if any(x in name for x in ["availability", "uptime"]):
-            groups["availability"].append(col)
-
-    return groups
-
-
-def health_score(df):
-    """
-    Heuristic health score.
-
-    Important:
-    This is not a vendor-specific SLA calculation. It is a simple screening
-    score intended to help an engineer identify records worth investigating.
-    """
-    groups = detect_metric_columns(df)
-    score = 100.0
-    findings = []
-
-    for col in groups["utilization"]:
-        series = pd.to_numeric(df[col], errors="coerce").dropna()
-        if len(series):
-            high = float((series >= 90).mean())
-            if high > 0:
-                score -= min(20, high * 20)
-                findings.append(
-                    f"{col}: {high:.0%} of numeric records are >= 90."
-                )
-
-    for col in groups["latency"]:
-        series = pd.to_numeric(df[col], errors="coerce").dropna()
-        if len(series):
-            high = float((series >= 100).mean())
-            if high > 0:
-                score -= min(20, high * 20)
-                findings.append(
-                    f"{col}: {high:.0%} of numeric records are >= 100 "
-                    f"(threshold is a screening heuristic)."
-                )
-
-    for col in groups["packet_loss"]:
-        series = pd.to_numeric(df[col], errors="coerce").dropna()
-        if len(series):
-            high = float((series >= 1).mean())
-            if high > 0:
-                score -= min(25, high * 25)
-                findings.append(
-                    f"{col}: {high:.0%} of numeric records are >= 1 "
-                    f"(threshold is a screening heuristic)."
-                )
-
-    for col in groups["errors"]:
-        series = pd.to_numeric(df[col], errors="coerce").dropna()
-        if len(series):
-            high = float((series > 0).mean())
-            if high > 0:
-                score -= min(20, high * 20)
-                findings.append(
-                    f"{col}: non-zero values found in {high:.0%} of records."
-                )
-
-    for col in groups["availability"]:
-        series = pd.to_numeric(df[col], errors="coerce").dropna()
-        if len(series):
-            low = float((series < 99).mean())
-            if low > 0:
-                score -= min(20, low * 20)
-                findings.append(
-                    f"{col}: {low:.0%} of records are below 99 "
-                    f"(threshold is a screening heuristic)."
-                )
-
-    score = max(0.0, min(100.0, score))
-
-    if score >= 85:
-        status = "Healthy"
-    elif score >= 65:
-        status = "Warning"
     else:
-        status = "Critical"
+        prompt = f"""
+You are an AI NOC Copilot.
 
-    return score, status, findings, groups
+Answer the user's question using your general model knowledge.
+
+USER QUESTION:
+{question}
+
+Rules:
+- Give a clear answer.
+- Do not invent device output or network measurements.
+- Clearly say when evidence is insufficient.
+"""
+
+    try:
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.groq.com/openai/v1",
+        )
+
+        response = client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=[
+                {"role": "system", "content": "You are a helpful NOC AI assistant."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+        )
+
+        return response.choices[0].message.content, None
+
+    except Exception as exc:
+        return None, str(exc)
 
 
-def network_health_analysis(df):
-    score, status, findings, groups = health_score(df)
+# =========================================================
+# 5. Clear
+# =========================================================
+def clear_results():
+    st.session_state.question = ""
+    st.session_state.answer = ""
+    st.session_state.rag_results = []
+    st.session_state.error = ""
+    st.session_state.drive_chunks = []
+    st.session_state.drive_files = []
 
-    numeric = df.select_dtypes(include=np.number)
 
-    summary = {
-        "rows": len(df),
-        "columns": len(df.columns),
-        "numeric_columns": list(numeric.columns),
-        "missing_values": int(df.isna().sum().sum()),
+# =========================================================
+
+def classify_incident(question):
+    """Lightweight rule-based incident classification for the learning/demo app."""
+    q = question.lower()
+
+    protocol_rules = [
+        ("BGP", ["bgp", "border gateway", "peer session", "bgp peer"]),
+        ("OSPF", ["ospf", "neighbor adjacency", "ospf neighbor"]),
+        ("MTU", ["mtu", "maximum transmission unit", "large ping", "fragmentation"]),
+        ("Interface / Physical", ["crc", "input errors", "interface error", "optic", "transceiver", "fiber", "duplex"]),
+        ("Packet Loss / Congestion", ["packet loss", "congestion", "utilization", "interface utilization", "drops"]),
+    ]
+
+    matched = []
+    for protocol, keywords in protocol_rules:
+        if any(k in q for k in keywords):
+            matched.append(protocol)
+
+    if matched:
+        protocol = matched[0]
+    else:
+        protocol = "General Network"
+
+    incident_rules = [
+        ("Session Down", ["session down", "peer down", "bgp down", "neighbor down", "adjacency down"]),
+        ("Packet Loss", ["packet loss", "packet drops", "drops"]),
+        ("CRC / Interface Errors", ["crc", "input errors", "interface errors"]),
+        ("MTU / Fragmentation", ["mtu", "fragmentation", "large ping", "large packets"]),
+        ("Congestion / High Utilization", ["congestion", "high utilization", "95% utilization", "interface utilization"]),
+        ("Connectivity Failure", ["cannot reach", "unreachable", "connectivity", "no connectivity"]),
+    ]
+
+    incident = "Network Incident"
+    for name, keywords in incident_rules:
+        if any(k in q for k in keywords):
+            incident = name
+            break
+
+    category_map = {
+        "BGP": "Routing",
+        "OSPF": "Routing",
+        "MTU": "IP / Transport",
+        "Interface / Physical": "Physical / Interface",
+        "Packet Loss / Congestion": "Performance",
+        "General Network": "Network Operations",
     }
+    category = category_map.get(protocol, "Network Operations")
 
     return {
-        "score": score,
-        "status": status,
-        "findings": findings,
-        "groups": groups,
-        "summary": summary,
+        "protocol": protocol,
+        "incident": incident,
+        "category": category,
     }
 
 
-# -----------------------------
-# NOC Report Generator
-# -----------------------------
-def generate_noc_report(
-    subject,
-    summary,
-    start_time,
-    end_time,
-    root_cause,
-    impacted_services,
-    recommendations,
-):
-    duration = "Not calculated"
+# =========================================================
+# 6. UI — modular NOC dashboard
+# =========================================================
+st.set_page_config(
+    page_title="AI-NOC Copilot",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown("""
+<style>
+.stApp { background:#030303; color:#f5f5f5; }
+[data-testid="stHeader"] { background:rgba(0,0,0,0); }
+.block-container { max-width:1500px; padding:.55rem 1.25rem .35rem; }
+[data-testid="stSidebar"] { background:#070707; border-right:1px solid #252525; }
+[data-testid="stSidebar"] * { color:#f2f2f2; }
+
+.hero {
+  background:radial-gradient(circle at 82% 50%, rgba(50,120,180,.16), transparent 34%),
+             linear-gradient(135deg,#101010,#070707);
+  border:1px solid #292929; border-radius:16px;
+  padding:.65rem 1rem; margin-bottom:.5rem;
+  min-height:112px; display:flex; align-items:center; justify-content:space-between;
+  overflow:hidden;
+}
+.hero h1 {margin:0;font-size:1.65rem;color:#fff;}
+.hero p {margin:.12rem 0 0;color:#999;font-size:.78rem;}
+.hero-kicker {color:#70c8ff;font-size:.62rem;letter-spacing:.12em;font-weight:700;}
+.noc-visual {width:400px;flex:0 0 400px;}
+
+.sidebar-brand {font-size:1.05rem;font-weight:800;margin-bottom:.15rem;}
+.sidebar-sub {color:#8d8d8d;font-size:.74rem;margin-bottom:.7rem;}
+.module-note {
+  background:#0c0c0c;border:1px solid #282828;border-radius:10px;
+  padding:.55rem .65rem;margin-top:.7rem;color:#999;font-size:.7rem;line-height:1.35;
+}
+.section-label {color:#d0d0d0;font-size:.69rem;text-transform:uppercase;letter-spacing:.1em;margin:.22rem 0 .18rem;font-weight:700;}
+.status-card {
+  background:#090909;border:1px solid #292929;border-radius:9px;
+  padding:.38rem .6rem;color:#c8c8c8;font-size:.73rem;margin-bottom:.25rem;
+}
+div[data-testid="stTextArea"] textarea {
+  background:#0b0b0b !important;color:#f7f7f7 !important;
+  border:1px solid #3a3a3a !important;border-radius:10px !important;
+  min-height:60px !important;
+}
+div[data-testid="stTextArea"] textarea::placeholder {color:#9b9b9b !important;opacity:1 !important;}
+div[data-testid="stRadio"] > div {gap:.35rem;}
+div[data-testid="stRadio"] label {
+  background:#111 !important;border:1px solid #3a3a3a !important;
+  border-radius:10px !important;padding:.25rem .55rem !important;color:#fff !important;opacity:1 !important;
+}
+div[data-testid="stRadio"] label p, div[data-testid="stRadio"] label span,
+div[data-testid="stRadio"] label div {color:#fff !important;opacity:1 !important;}
+div[data-testid="stButton"] button {border-radius:10px;min-height:2.15rem;font-weight:700;}
+div[data-testid="stButton"] button p {color:#fff !important;}
+.class-card {
+  background:#0b0b0b;border:1px solid #2b2b2b;border-radius:9px;padding:.4rem .6rem;min-height:48px;
+}
+.class-card span {display:block;color:#777;font-size:.59rem;letter-spacing:.1em;font-weight:700;}
+.class-card strong {display:block;color:#f5f5f5;font-size:.79rem;margin-top:.1rem;}
+.source-caption {color:#777;font-size:.66rem;text-align:right;padding-top:.42rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.result-title {font-size:.92rem;font-weight:750;margin-bottom:.15rem;color:#f5f5f5;}
+.result-sub {color:#8f8f8f;font-size:.69rem;margin-bottom:.3rem;}
+.compare-note {color:#777;font-size:.66rem;margin-top:.2rem;}
+.health-card {
+  background:#0b0b0b;border:1px solid #292929;border-radius:12px;
+  padding:.75rem .85rem;min-height:92px;
+}
+.health-card .label {color:#777;font-size:.6rem;letter-spacing:.1em;font-weight:700;}
+.health-card .value {color:#fff;font-size:1.15rem;font-weight:800;margin-top:.15rem;}
+.report-box {background:#0b0b0b;border:1px solid #292929;border-radius:12px;padding:.85rem;}
+footer {visibility:hidden;}
+
+.stFileUploader {
+  background:#0b0b0b; border:1px dashed #3a3a3a; border-radius:10px; padding:.15rem;
+}
+
+.stTextInput, .stTextArea { margin-bottom:.18rem; }
+form [data-testid="stTextInput"] input,
+form [data-testid="stTextArea"] textarea { color:#f5f5f5 !important; }
+</style>
+""", unsafe_allow_html=True)
+
+# Sidebar: one module list only (no duplicate explanatory cards).
+with st.sidebar:
+    st.markdown('<div class="sidebar-brand">🤖 AI-NOC Copilot</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-sub">AI-powered NOC learning & analysis</div>', unsafe_allow_html=True)
+    st.markdown("---")
+    st.markdown("### MODULES")
+    module = st.radio(
+        "Module",
+        ["🚨 Incident Analysis", "📊 Network Health", "📑 NOC Report Generator"],
+        index=0,
+        label_visibility="collapsed",
+    )
+    st.markdown("---")
+    descriptions = {
+        "🚨 Incident Analysis": "Investigate incidents using AI + your NOC knowledge base.",
+        "📊 Network Health": "Review network metrics and identify potential issues.",
+        "📑 NOC Report Generator": "Create a structured incident report from analysis.",
+    }
+    st.markdown(
+        f'<div class="module-note"><b>{module}</b><br>{descriptions[module]}</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption("Learning / Demo Project")
+
+# One topology banner only.
+st.markdown("""
+<div class="hero">
+  <div>
+    <div class="hero-kicker">NETWORK OPERATIONS • AI ASSISTANT</div>
+    <h1>🤖 AI-NOC Copilot</h1>
+    <p>Investigate • Assess • Report</p>
+  </div>
+  <div class="noc-visual">
+    <svg viewBox="0 0 500 150" xmlns="http://www.w3.org/2000/svg">
+      <g fill="none" stroke="#4e9ed1" stroke-opacity=".65" stroke-width="2">
+        <path d="M45 75 L150 38 L250 75 L350 38 L455 75"/>
+        <path d="M45 75 L150 112 L250 75 L350 112 L455 75"/>
+        <path d="M150 38 L150 112"/><path d="M350 38 L350 112"/>
+      </g>
+      <g fill="#090909" stroke="#70c8ff" stroke-width="2">
+        <rect x="22" y="53" width="46" height="44" rx="9"/><rect x="127" y="16" width="46" height="44" rx="9"/>
+        <rect x="127" y="90" width="46" height="44" rx="9"/><rect x="227" y="53" width="46" height="44" rx="9"/>
+        <rect x="327" y="16" width="46" height="44" rx="9"/><rect x="327" y="90" width="46" height="44" rx="9"/>
+        <rect x="432" y="53" width="46" height="44" rx="9"/>
+      </g>
+      <g fill="#dff5ff" font-family="Arial" font-size="9" text-anchor="middle">
+        <text x="45" y="80">EDGE</text><text x="150" y="43">R1</text><text x="150" y="117">R2</text>
+        <text x="250" y="80">CORE</text><text x="350" y="43">R3</text><text x="350" y="117">R4</text><text x="455" y="80">NOC</text>
+      </g>
+    </svg>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+# Session state
+for key, default in {
+    "question": "", "answer": "", "rag_results": [], "error": "",
+    "drive_chunks": [], "drive_files": [],
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+def render_incident_analysis():
+    try:
+        with st.spinner("Loading NOC knowledge base..."):
+            rag_chunks, drive_files = load_google_drive(FIXED_GOOGLE_DRIVE_URL)
+        st.session_state.drive_chunks = rag_chunks
+        st.session_state.drive_files = drive_files
+        status_text = f"● NOC knowledge ready  •  {len(drive_files)} docs  •  {len(rag_chunks)} chunks"
+    except Exception as exc:
+        rag_chunks = st.session_state.get("drive_chunks", [])
+        drive_files = st.session_state.get("drive_files", [])
+        status_text = f"⚠ Knowledge base: {exc}"
+
+    st.markdown(f'<div class="status-card">{status_text}</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">Ask your NOC question</div>', unsafe_allow_html=True)
+    question = st.text_area(
+        "Question", value=st.session_state.question,
+        placeholder="Example: What can cause a BGP session to go down?",
+        height=68, label_visibility="collapsed",
+    )
+
+    info = classify_incident(question) if question.strip() else {"protocol":"—","incident":"—","category":"—"}
+    st.markdown('<div class="section-label">Automatic incident classification</div>', unsafe_allow_html=True)
+    c1,c2,c3=st.columns(3)
+    with c1:
+        st.markdown(f'<div class="class-card"><span>PROTOCOL</span><strong>{info["protocol"]}</strong></div>', unsafe_allow_html=True)
+    with c2:
+        st.markdown(f'<div class="class-card"><span>INCIDENT</span><strong>{info["incident"]}</strong></div>', unsafe_allow_html=True)
+    with c3:
+        st.markdown(f'<div class="class-card"><span>CATEGORY</span><strong>{info["category"]}</strong></div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="section-label">Choose answer mode</div>', unsafe_allow_html=True)
+    mode = st.radio(
+        "Answer mode",
+        ["🧠 AI Response", "📚 RAG Response", "🔍 RAG + AI Comparison"],
+        index=0, horizontal=True, label_visibility="collapsed",
+    )
+    c1,c2,c3=st.columns([1.35,1,1])
+    with c1:
+        analyze=st.button("🚀 Analyze Incident",type="primary",use_container_width=True)
+    with c2:
+        clear=st.button("🗑️ Clear",use_container_width=True)
+    with c3:
+        if drive_files:
+            st.markdown(f'<div class="source-caption">📁 Fixed Google Drive • {len(drive_files)} documents</div>',unsafe_allow_html=True)
+
+    if clear:
+        clear_results()
+        st.rerun()
+
+    if analyze:
+        q=question.strip()
+        if not q:
+            st.warning("Enter a NOC question first.")
+            return
+        st.session_state.question=q
+        st.session_state.answer=""
+        st.session_state.rag_results=[]
+        st.session_state.error=""
+
+        if mode=="🧠 AI Response":
+            with st.spinner("Generating AI response..."):
+                answer,error=call_llm(q)
+            if error: st.session_state.error=error
+            else: st.session_state.answer=answer
+        elif mode=="📚 RAG Response":
+            if not rag_chunks:
+                st.session_state.error="No RAG documents are available."
+            else:
+                results=retrieve_knowledge(q,rag_chunks)
+                st.session_state.rag_results=results
+                if not results:
+                    st.session_state.error="No relevant content was found in the NOC knowledge base."
+        else:
+            if not rag_chunks:
+                st.session_state.error="No RAG documents are available."
+            else:
+                results=retrieve_knowledge(q,rag_chunks)
+                st.session_state.rag_results=results
+                context="\n\n".join(f"SOURCE: {x['source']}\n{x['text']}" for x in results)
+                with st.spinner("Comparing RAG evidence with AI reasoning..."):
+                    answer,error=call_llm(q,rag_context=context if context else None)
+                if error: st.session_state.error=error
+                else: st.session_state.answer=answer
+
+    if st.session_state.error:
+        st.error(st.session_state.error)
+    rag=st.session_state.rag_results
+    ans=st.session_state.answer
+    if mode=="🔍 RAG + AI Comparison" and (rag or ans):
+        left,right=st.columns(2,gap="medium")
+        with left:
+            st.markdown('<div class="result-title">📚 RAG Evidence</div><div class="result-sub">What your NOC documents say</div>',unsafe_allow_html=True)
+            with st.container(height=290,border=True):
+                if rag:
+                    for item in rag:
+                        st.markdown(f"**{item['source']}**")
+                        st.write(item["text"])
+                else: st.info("No matching RAG evidence.")
+        with right:
+            st.markdown('<div class="result-title">🧠 AI Explanation</div><div class="result-sub">LLM explanation grounded in retrieved evidence</div>',unsafe_allow_html=True)
+            with st.container(height=290,border=True):
+                if ans: st.markdown(ans)
+                else: st.info("No AI response.")
+    elif rag:
+        st.markdown('<div class="result-title">📚 RAG Retrieved Result</div><div class="result-sub">Focused evidence from your NOC knowledge base</div>',unsafe_allow_html=True)
+        with st.container(height=290,border=True):
+            for item in rag:
+                st.markdown(f"**{item['source']}**")
+                st.write(item["text"])
+    elif ans:
+        st.markdown('<div class="result-title">🧠 AI Response</div><div class="result-sub">Generated from general model knowledge</div>',unsafe_allow_html=True)
+        with st.container(height=290,border=True):
+            st.markdown(ans)
+
+    st.markdown('<div class="compare-note">Learning/demo project — verify AI answers against real network evidence before operational use.</div>',unsafe_allow_html=True)
+
+def render_network_health():
+    st.markdown("### 📊 Network Health")
+    st.caption("Upload a CSV containing network interface metrics, then generate a health-check summary.")
+
+    st.markdown('<div class="section-label">Upload network health CSV</div>', unsafe_allow_html=True)
+    uploaded_csv = st.file_uploader(
+        "CSV file",
+        type=["csv"],
+        help="Required columns: Interface, Utilization, Packet Loss, CRC Errors.",
+        label_visibility="collapsed",
+    )
+
+    if uploaded_csv is None:
+        st.info("Upload a CSV file to begin the health check.")
+        st.caption("Required columns: Interface, Utilization, Packet Loss, CRC Errors")
+        return
 
     try:
-        start = datetime.fromisoformat(start_time)
-        end = datetime.fromisoformat(end_time)
-        seconds = max(0, int((end - start).total_seconds()))
-        duration = f"{seconds // 3600}h {(seconds % 3600) // 60}m"
-    except Exception:
-        pass
+        df = pd.read_csv(uploaded_csv)
+    except Exception as e:
+        st.error(f"Could not read the CSV: {e}")
+        return
 
-    return f"""# NOC Incident Report
+    aliases = {
+        "interface": "Interface",
+        "interface_name": "Interface",
+        "utilization": "Utilization",
+        "utilization_%": "Utilization",
+        "packet_loss": "Packet Loss",
+        "packet loss": "Packet Loss",
+        "packet_loss_%": "Packet Loss",
+        "crc_errors": "CRC Errors",
+        "crc errors": "CRC Errors",
+        "crc": "CRC Errors",
+    }
+    rename = {}
+    for col in df.columns:
+        key = str(col).strip().lower()
+        if key in aliases:
+            rename[col] = aliases[key]
+    df = df.rename(columns=rename)
 
-## 1. Incident Details
-- **Subject:** {subject}
-- **Start Time:** {start_time}
-- **End Time:** {end_time}
-- **Duration:** {duration}
+    required = ["Interface", "Utilization", "Packet Loss", "CRC Errors"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        st.error("Missing required column(s): " + ", ".join(missing))
+        st.info("Required columns: Interface, Utilization, Packet Loss, CRC Errors")
+        return
 
-## 2. Incident Summary
-{summary}
+    for col in ["Utilization", "Packet Loss", "CRC Errors"]:
+        df[col] = pd.to_numeric(
+            df[col].astype(str)
+            .str.replace("%", "", regex=False)
+            .str.replace(",", "", regex=False),
+            errors="coerce",
+        )
 
-## 3. Root Cause
+    df["Interface"] = df["Interface"].astype(str).str.strip()
+    df = df.dropna(subset=["Interface", "Utilization", "Packet Loss", "CRC Errors"]).copy()
+
+    if df.empty:
+        st.error("The CSV contains no valid network interface records.")
+        return
+
+    st.markdown(
+        f'<div class="status-card">📄 <b>{uploaded_csv.name}</b> &nbsp;•&nbsp; {len(df)} interface record(s) loaded</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="section-label">Uploaded Metrics</div>', unsafe_allow_html=True)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.markdown("")
+    generate = st.button("📊 Generate Health Check Summary", type="primary", use_container_width=True)
+
+    if not generate:
+        st.caption("Review the uploaded metrics, then click the button above to generate the summary.")
+        return
+
+    def health_status(row):
+        if row["Packet Loss"] >= 3 or row["CRC Errors"] > 100 or row["Utilization"] >= 95:
+            return "🔴 Investigate"
+        if row["Packet Loss"] > 0 or row["CRC Errors"] > 0 or row["Utilization"] >= 80:
+            return "🟠 Attention"
+        return "🟢 Healthy"
+
+    df["Status"] = df.apply(health_status, axis=1)
+
+    critical = df[df["Status"] == "🔴 Investigate"]
+    attention = df[df["Status"] == "🟠 Attention"]
+    healthy = df[df["Status"] == "🟢 Healthy"]
+
+    if len(critical):
+        overall = "🔴 Investigate"
+    elif len(attention):
+        overall = "🟠 Attention"
+    else:
+        overall = "🟢 Healthy"
+
+    high_util_row = df.loc[df["Utilization"].idxmax()]
+    max_loss_row = df.loc[df["Packet Loss"].idxmax()]
+    max_crc_row = df.loc[df["CRC Errors"].idxmax()]
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.markdown(f'<div class="health-card"><div class="label">OVERALL HEALTH</div><div class="value">{overall}</div></div>', unsafe_allow_html=True)
+    with c2:
+        st.markdown(f'<div class="health-card"><div class="label">INTERFACES</div><div class="value">{len(df)}</div></div>', unsafe_allow_html=True)
+    with c3:
+        st.markdown(f'<div class="health-card"><div class="label">INVESTIGATE</div><div class="value">{len(critical)}</div></div>', unsafe_allow_html=True)
+    with c4:
+        st.markdown(f'<div class="health-card"><div class="label">ATTENTION</div><div class="value">{len(attention)}</div></div>', unsafe_allow_html=True)
+
+    st.markdown("#### Health Check Summary")
+    summary_parts = [
+        f"**Overall status:** {overall}.",
+        f"**Highest utilization:** {high_util_row['Interface']} at {high_util_row['Utilization']:.1f}%.",
+        f"**Highest packet loss:** {max_loss_row['Interface']} at {max_loss_row['Packet Loss']:.2f}%.",
+        f"**Highest CRC errors:** {max_crc_row['Interface']} with {max_crc_row['CRC Errors']:.0f}.",
+        f"**Healthy interfaces:** {len(healthy)} of {len(df)}.",
+    ]
+    for item in summary_parts:
+        st.write("• " + item)
+
+    if len(critical):
+        st.markdown("#### 🔴 Interfaces Requiring Investigation")
+        for _, row in critical.iterrows():
+            reasons = []
+            if row["Utilization"] >= 95:
+                reasons.append(f"utilization {row['Utilization']:.1f}%")
+            if row["Packet Loss"] >= 3:
+                reasons.append(f"packet loss {row['Packet Loss']:.2f}%")
+            if row["CRC Errors"] > 100:
+                reasons.append(f"CRC errors {row['CRC Errors']:.0f}")
+            st.write(f"• **{row['Interface']}** — " + ", ".join(reasons) + ".")
+
+    if len(attention):
+        st.markdown("#### 🟠 Interfaces Requiring Attention")
+        for _, row in attention.iterrows():
+            reasons = []
+            if row["Utilization"] >= 80:
+                reasons.append(f"utilization {row['Utilization']:.1f}%")
+            if row["Packet Loss"] > 0:
+                reasons.append(f"packet loss {row['Packet Loss']:.2f}%")
+            if row["CRC Errors"] > 0:
+                reasons.append(f"CRC errors {row['CRC Errors']:.0f}")
+            st.write(f"• **{row['Interface']}** — " + ", ".join(reasons) + ".")
+
+    st.caption("Learning/demo project: health thresholds are simplified for demonstration and should be validated against real network baselines.")
+
+def render_report_generator():
+    st.markdown("### 📑 NOC Report Generator")
+    st.caption("Enter the details of a network incident and generate a structured NOC incident report.")
+
+    with st.form("report_form"):
+        st.markdown('<div class="section-label">Incident Details</div>', unsafe_allow_html=True)
+
+        st.markdown("**Incident Subject**")
+        incident_subject = st.text_input(
+            "Incident Subject",
+            placeholder="Example: BGP Session Down between PE1 and PE2",
+            label_visibility="collapsed",
+        )
+
+        st.markdown("**Incident Summary**")
+        incident_summary = st.text_area(
+            "Incident Summary",
+            placeholder="Describe what happened, what was observed, and the impact.",
+            height=75,
+            label_visibility="collapsed",
+        )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Incident Start Time**")
+            start_time = st.text_input(
+                "Incident Start Time",
+                placeholder="Example: 2026-09-12 10:30 PKT",
+                label_visibility="collapsed",
+            )
+        with c2:
+            st.markdown("**Incident End Time**")
+            end_time = st.text_input(
+                "Incident End Time",
+                placeholder="Example: 2026-09-12 11:15 PKT",
+                label_visibility="collapsed",
+            )
+
+        st.markdown("**Root Cause of Incident**")
+        root_cause = st.text_area(
+            "Root Cause",
+            placeholder="Describe the confirmed or probable root cause. If not confirmed, state that clearly.",
+            height=75,
+            label_visibility="collapsed",
+        )
+
+        st.markdown("**Services Impacted**")
+        services_impacted = st.text_area(
+            "Services Impacted",
+            placeholder="Example: Internet access, IP transit, BGP routes, customer VPN services",
+            height=65,
+            label_visibility="collapsed",
+        )
+
+        st.markdown("**Recommendations / Checks**")
+        recommendations = st.text_area(
+            "Recommendations",
+            placeholder="List recommended checks, corrective actions, or follow-up items.",
+            height=85,
+            label_visibility="collapsed",
+        )
+
+        generate = st.form_submit_button(
+            "📄 Generate Incident Report",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if generate:
+        required_fields = {
+            "Incident Subject": incident_subject,
+            "Incident Summary": incident_summary,
+            "Incident Start Time": start_time,
+            "Incident End Time": end_time,
+            "Root Cause": root_cause,
+            "Services Impacted": services_impacted,
+            "Recommendations / Checks": recommendations,
+        }
+        missing = [name for name, value in required_fields.items() if not value.strip()]
+        if missing:
+            st.warning("Please complete: " + ", ".join(missing))
+            return
+
+        report = f"""# NOC INCIDENT REPORT
+
+## Incident Subject
+{incident_subject}
+
+## Incident Summary
+{incident_summary}
+
+## Incident Start Time
+{start_time}
+
+## Incident End Time
+{end_time}
+
+## Root Cause of Incident
 {root_cause}
 
-## 4. Impacted Services
-{impacted_services}
+## Services Impacted
+{services_impacted}
 
-## 5. Recommendations
+## Recommendations / Checks
 {recommendations}
 
-## 6. Engineer Validation
-This report was prepared from information provided by the NOC engineer.
-Root cause, impact, remediation, and closure should be verified by the
-responsible engineer before the incident is considered final.
-
 ---
-Generated by AI-NOC Copilot
+**AI-NOC Copilot**
+Learning / Demo Project
 """
 
-
-# -----------------------------
-# UI helpers
-# -----------------------------
-def show_sidebar():
-    st.sidebar.title("🛡️ AI-NOC Copilot")
-    st.sidebar.caption("AI assistance for NOC engineers")
-
-    module = st.sidebar.radio(
-        "Select module",
-        [
-            "Incident Analysis",
-            "Network Health",
-            "NOC Report Generator",
-        ],
-    )
-
-    st.sidebar.divider()
-    st.sidebar.info(
-        "AI-NOC Copilot supports the engineer. "
-        "Always verify evidence before making production changes."
-    )
-
-    return module
-
-
-def incident_module():
-    st.title("🚨 Incident Analysis")
-    st.write(
-        "Analyze an incident using your NOC knowledge documents and an "
-        "AI response. The engineer remains in control of the final decision."
-    )
-
-    with st.expander("RAG / Knowledge Base"):
-        folder_id = st.text_input(
-            "Google Drive Folder ID (optional)",
-            value=get_secret("GOOGLE_DRIVE_FOLDER_ID", ""),
-            help="Use the folder ID containing your NOC knowledge documents.",
-        )
-
-        uploaded_docs = st.file_uploader(
-            "Or upload knowledge documents",
-            type=["txt", "md", "csv", "pdf", "docx"],
-            accept_multiple_files=True,
-        )
-
-        drive_documents = []
-        if folder_id:
-            if st.button("Load Google Drive Knowledge Base"):
-                with st.spinner("Loading documents from Google Drive..."):
-                    drive_documents, error = load_drive_documents(folder_id)
-                    if error:
-                        st.error(error)
-                    else:
-                        st.session_state["drive_documents"] = drive_documents
-                        st.success(
-                            f"Loaded {len(drive_documents)} document(s) from Google Drive."
-                        )
-        else:
-            st.caption(
-                "If Google Drive is configured in Streamlit secrets, enter the "
-                "folder ID here. Otherwise use uploaded files."
-            )
-
-        if "drive_documents" in st.session_state:
-            drive_documents = st.session_state["drive_documents"]
-
-        local_documents = []
-        for uploaded in uploaded_docs or []:
-            text = extract_uploaded_document(uploaded)
-            if text:
-                local_documents.append(
-                    {
-                        "name": uploaded.name,
-                        "text": clean_text(text),
-                    }
-                )
-
-        all_documents = drive_documents + local_documents
-
-        if all_documents:
-            st.write(f"Knowledge documents available: **{len(all_documents)}**")
-            rag_index = build_rag_index(all_documents)
-            st.session_state["rag_index"] = rag_index
-        else:
-            rag_index = st.session_state.get("rag_index")
-
-        if rag_index:
-            st.success(
-                f"RAG index ready: {len(rag_index['chunks'])} text chunks."
-            )
-        else:
-            st.warning(
-                "No knowledge documents are loaded. Incident analysis can still "
-                "be entered, but document-based comparison will not be available."
-            )
-
-    st.divider()
-
-    subject = st.text_input("Incident subject")
-    description = st.text_area(
-        "Incident description",
-        height=180,
-        placeholder=(
-            "Example: Users reported intermittent service degradation. "
-            "Enter only facts known to the engineer."
-        ),
-    )
-
-    top_k = st.slider("Number of knowledge chunks to retrieve", 1, 8, 5)
-
-    if st.button("Analyze Incident", type="primary"):
-        if not subject.strip() or not description.strip():
-            st.warning("Please provide both incident subject and description.")
-            return
-
-        rag_index = st.session_state.get("rag_index")
-        results = retrieve_context(rag_index, description, top_k)
-
-        st.subheader("Retrieved Evidence")
-        if results:
-            for item in results:
-                with st.expander(
-                    f"{item['document']} | relevance {item['score']:.2f}"
-                ):
-                    st.write(item["text"])
-        else:
-            st.info("No relevant knowledge-base evidence was retrieved.")
-
-        with st.spinner("Generating AI assessment..."):
-            answer, error = incident_analysis(
-                subject,
-                description,
-                results,
-            )
-
-        st.subheader("AI-NOC Assessment")
-        if error:
-            st.error(error)
-        else:
-            st.markdown(answer)
-
-        st.warning(
-            "Engineer control: verify alarms, logs, counters, topology, "
-            "configuration, and other operational evidence before taking action."
-        )
-
-
-def health_module():
-    st.title("📊 Network Health")
-    st.write(
-        "Upload a CSV containing network metrics. The tool screens the data "
-        "for common performance/error indicators."
-    )
-
-    uploaded = st.file_uploader(
-        "Upload network health CSV",
-        type=["csv"],
-        key="health_csv",
-    )
-
-    if not uploaded:
-        st.info(
-            "Expected examples of metric columns include utilization, latency, "
-            "packet_loss, errors, CRC, drops, or availability."
-        )
-        return
-
-    try:
-        df = pd.read_csv(uploaded)
-    except Exception as exc:
-        st.error(f"Could not read CSV: {exc}")
-        return
-
-    st.subheader("Uploaded Data")
-    st.dataframe(df, use_container_width=True)
-
-    result = network_health_analysis(df)
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Health Score", f"{result['score']:.0f}/100")
-    col2.metric("Status", result["status"])
-    col3.metric("Records", result["summary"]["rows"])
-
-    st.subheader("Detected Metrics")
-    for category, columns in result["groups"].items():
-        if columns:
-            st.write(f"**{category.title()}:** {', '.join(columns)}")
-
-    st.subheader("Findings")
-    if result["findings"]:
-        for finding in result["findings"]:
-            st.warning(finding)
-    else:
-        st.success(
-            "No issues were flagged by the built-in screening rules."
-        )
-
-    st.caption(
-        "Important: the score and thresholds are generic screening heuristics, "
-        "not vendor-specific thresholds or an SLA determination. Confirm "
-        "against your network's actual design, vendor guidance, and KPIs."
-    )
-
-
-def report_module():
-    st.title("📝 NOC Report Generator")
-    st.write(
-        "Create a structured incident report from facts entered by the NOC engineer."
-    )
-
-    subject = st.text_input("Incident subject", key="report_subject")
-    summary = st.text_area("Incident summary", height=120)
-    start_time = st.text_input(
-        "Start time",
-        placeholder="YYYY-MM-DD HH:MM",
-    )
-    end_time = st.text_input(
-        "End time",
-        placeholder="YYYY-MM-DD HH:MM",
-    )
-    root_cause = st.text_area("Root cause")
-    impacted_services = st.text_area("Impacted services")
-    recommendations = st.text_area("Recommendations")
-
-    if st.button("Generate NOC Report", type="primary"):
-        if not subject.strip() or not summary.strip():
-            st.warning("Incident subject and summary are required.")
-            return
-
-        report = generate_noc_report(
-            subject,
-            summary,
-            start_time,
-            end_time,
-            root_cause,
-            impacted_services,
-            recommendations,
-        )
-
-        st.subheader("Generated Report")
+        st.markdown("#### Generated NOC Incident Report")
+        st.markdown('<div class="report-box">', unsafe_allow_html=True)
         st.markdown(report)
+        st.markdown("</div>", unsafe_allow_html=True)
 
         st.download_button(
-            "Download Markdown Report",
-            data=report,
+            "⬇️ Download Incident Report",
+            report,
             file_name="noc_incident_report.md",
             mime="text/markdown",
+            use_container_width=True,
         )
 
-
-# -----------------------------
-# Main
-# -----------------------------
-def main():
-    module = show_sidebar()
-
-    if module == "Incident Analysis":
-        incident_module()
-    elif module == "Network Health":
-        health_module()
-    elif module == "NOC Report Generator":
-        report_module()
-
-
-if __name__ == "__main__":
-    main()
+if module=="📊 Network Health":
+    render_network_health()
+elif module=="📑 NOC Report Generator":
+    render_report_generator()
+else:
+    render_incident_analysis()
